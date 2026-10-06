@@ -4267,8 +4267,8 @@ class NormalPlayerReasoningEngine {
       }
     });
 
-    // 藥不然偷方震連鎖許願推理
-    if (pov.myRole === '藥不然') {
+    // 藥不然與老朝奉同盟：偷方震連鎖許願推理
+    if (pov.myRole === '藥不然' || pov.myRole === '老朝奉') {
       const ambushList = pov.yaoAmbushHistory || [];
       const ambushKeywords = /(被偷襲|眼前一片黑|偷襲我|螢幕全黑|被幹瞎|失血過多|驗不到|看不到獸首|接過來就是黑的|沒看到獸首|被致盲)/;
       ambushList.forEach(amb => {
@@ -4281,7 +4281,7 @@ class NormalPlayerReasoningEngine {
         const nextSpeeches = (pov.speeches && pov.speeches[ambRound + 1]) || [];
         [...rSpeeches, ...nextSpeeches].forEach(sp => {
           const spId = sp.playerId || sp.speakerId;
-          if (spId && spId !== targetAId && spId !== pov.myId) {
+          if (spId && spId !== targetAId && spId !== pov.myId && !(pov.knownTeammateIds || []).includes(spId)) {
             const spText = sp.speech || sp.text || '';
             if (ambushKeywords.test(spText)) {
               const targetB = pov.otherPlayers.find(p => p.id === spId);
@@ -4614,7 +4614,10 @@ class BotDeductionEngine {
 
     const yaoPastAmbushedTargets = [];
     const yaoAmbushHistory = [];
-    if (me.role === '藥不然') {
+    if (me.role === '藥不然' || me.role === '老朝奉') {
+      const yaoBot = (room.players || []).find(p => p.role === '藥不然');
+      const yaoId = yaoBot ? yaoBot.id : (me.role === '藥不然' ? botId : null);
+      if (yaoId) {
       (room.rounds || []).forEach((r, rIdx) => {
         const tLog = r.turnLogs && r.turnLogs[botId];
         let targetId = (tLog && (tLog.ambushedPlayerId || tLog.yaoTargetId)) || r.ambushedPlayerId || r.yaoTargetId;
@@ -4631,12 +4634,13 @@ class BotDeductionEngine {
         }
       });
       // 亦納入當前回合已指定之偷襲目標
-      const curTLog = curRound.turnLogs && curRound.turnLogs[botId];
-      if (curTLog && (curTLog.ambushedPlayerId || curTLog.yaoTargetId)) {
-        const cId = curTLog.ambushedPlayerId || curTLog.yaoTargetId;
-        if (!yaoAmbushHistory.some(h => h.roundIdx === curRoundIdx)) {
-          yaoAmbushHistory.push({ roundIdx: curRoundIdx, targetId: cId });
-          if (!yaoPastAmbushedTargets.includes(cId)) yaoPastAmbushedTargets.push(cId);
+        const curTLog = curRound.turnLogs && curRound.turnLogs[yaoId];
+        if (curTLog && (curTLog.ambushedPlayerId || curTLog.yaoTargetId)) {
+          const cId = curTLog.ambushedPlayerId || curTLog.yaoTargetId;
+          if (!yaoAmbushHistory.some(h => h.roundIdx === curRoundIdx)) {
+            yaoAmbushHistory.push({ roundIdx: curRoundIdx, targetId: cId });
+            if (!yaoPastAmbushedTargets.includes(cId)) yaoPastAmbushedTargets.push(cId);
+          }
         }
       }
     }
@@ -5437,8 +5441,12 @@ class BotDeductionEngine {
         const goodCandidates = candidates.filter(c => !(pov.knownTeammateIds || []).includes(c.id));
         if (goodCandidates.length === 0) return candidates[0].id;
 
-        // 老朝奉抓許願
+        // 老朝奉抓許願（若已有連鎖致盲情報，100% 鎖定許願！）
         if (pov.myRole === '老朝奉') {
+          if (pov._yaoFangXuDeduction && pov._yaoFangXuDeduction.xuId) {
+            const xTarget = goodCandidates.find(c => c.id === pov._yaoFangXuDeduction.xuId);
+            if (xTarget) return xTarget.id;
+          }
           const scored = goodCandidates.map(c => {
             const b = (beliefs && beliefs.roleScores && beliefs.roleScores[c.id]) || { xuYuan: 10 };
             return { id: c.id, score: b.xuYuan || 10 };
@@ -14286,10 +14294,18 @@ function renderOnlinePersonVotingReference(room) {
             const beliefs = BotDeductionEngine.evaluateBeliefs(botPOV);
 
             let chosenId = geminiChosenId;
-            if (!chosenId || !candidates.some(c => c.id === chosenId)) {
+            const isEvil = !botPOV.isGoodCamp;
+            const teammates = botPOV.knownTeammateIds || [];
+            // 安全守衛：若為壞人，選取之目標絕不可為隊友
+            if (!chosenId || !candidates.some(c => c.id === chosenId) || (isEvil && teammates.includes(chosenId))) {
               chosenId = BotDeductionEngine.decidePersonVote(botPOV, beliefs, candidates);
             } else {
               console.log(`🧠 [Gemini 鑑人指認生效] 【${botPOV.myName}】指認目標:`, chosenId);
+            }
+            // 雙重安全確認：壞人絕不投票給已知隊友
+            if (isEvil && teammates.includes(chosenId)) {
+              const safeGoodCandidates = candidates.filter(c => !teammates.includes(c.id));
+              chosenId = safeGoodCandidates.length > 0 ? safeGoodCandidates[0].id : candidates[0].id;
             }
             pVotes[mockPlayerId] = chosenId || candidates[0].id;
           }
@@ -21127,27 +21143,46 @@ ${roundSpeeches}
     if (!c.on || !window.BotDeductionEngine) return;
     const pov = BotDeductionEngine.buildPOV(room, botId);
     const beliefs = BotDeductionEngine.evaluateBeliefs(pov);
-    const candidates = (room.players || []).filter(p => p.id !== botId);
+    
+    // 嚴格安全過濾：壞人陣營絕不將隊友列入指認候選人！
+    const isEvil = !pov.isGoodCamp;
+    const teammates = pov.knownTeammateIds || [];
+    const candidates = (room.players || []).filter(p => p.id !== botId && (!isEvil || !teammates.includes(p.id)));
     if (candidates.length === 0) return;
+
+    // 【鐵證硬鎖定】：若藥不然已推導出偷方震連鎖致盲，100% 直取方震，不交由模型二次臆測
+    if (pov.myRole === '藥不然' && pov._yaoFangXuDeduction && pov._yaoFangXuDeduction.fangId) {
+      if (candidates.some(c => c.id === pov._yaoFangXuDeduction.fangId)) {
+        cache['person_vote|' + botId] = pov._yaoFangXuDeduction.fangId;
+        return pov._yaoFangXuDeduction.fangId;
+      }
+    }
+    // 【鐵證硬鎖定】：若老朝奉已獲悉連鎖致盲許願情報，100% 直取許願
+    if (pov.myRole === '老朝奉' && pov._yaoFangXuDeduction && pov._yaoFangXuDeduction.xuId) {
+      if (candidates.some(c => c.id === pov._yaoFangXuDeduction.xuId)) {
+        cache['person_vote|' + botId] = pov._yaoFangXuDeduction.xuId;
+        return pov._yaoFangXuDeduction.xuId;
+      }
+    }
 
     const candStr = candidates.map(p => `${p.name}(ID:${p.id})`).join('、');
     const rs = (beliefs && beliefs.roleScores) || {};
     
-    // 依據自身身分提取專屬對決目標線索
+    // 依據自身身分提取專屬對決目標線索 (修復屬性名稱對齊 fangZhen / xuYuan)
     let targetClues = '';
     if (pov.myRole === '老朝奉') {
       targetClues = candidates.map(o => {
-        const xScore = (rs[o.id] && rs[o.id].xuYuanScore) || (100 - (rs[o.id] && rs[o.id].evilScore || 50));
+        const xScore = (rs[o.id] && (rs[o.id].xuYuan || rs[o.id].xuYuanScore)) || (100 - (rs[o.id] && rs[o.id].evilScore || 50));
         return `${o.name}: 許願特徵度 ${Math.round(xScore)}%`;
       }).join('、');
     } else if (pov.myRole === '藥不然') {
       targetClues = candidates.map(o => {
-        const fzScore = (rs[o.id] && rs[o.id].fangZhenScore) || 30;
+        const fzScore = (rs[o.id] && (rs[o.id].fangZhen || rs[o.id].fangZhenScore)) || 30;
         return `${o.name}: 方震偽裝嫌疑 ${Math.round(fzScore)}%`;
       }).join('、');
     } else {
       targetClues = candidates.map(o => {
-        const lScore = (rs[o.id] && rs[o.id].laoChaoFeng) || (rs[o.id] && rs[o.id].evilScore) || 20;
+        const lScore = (rs[o.id] && (rs[o.id].laoChaoFeng || rs[o.id].evilScore)) || 20;
         return `${o.name}: 老朝奉嫌疑 ${Math.round(lScore)}%`;
       }).join('、');
     }
@@ -21181,8 +21216,13 @@ ${roundSpeeches}
       try {
         const parsed = JSON.parse(out.replace(/```json|```/g, '').trim());
         if (parsed.targetId && candidates.some(c => c.id === parsed.targetId)) {
-          cache['person_vote|' + botId] = parsed.targetId;
-          return parsed.targetId;
+          // 安全守衛：壞人絕不可指認隊友
+          if (isEvil && teammates.includes(parsed.targetId)) {
+            console.warn(`[Gemini preparePersonVote] 阻擋壞人指認隊友: ${parsed.targetId}，由本地安全引擎指認`);
+          } else {
+            cache['person_vote|' + botId] = parsed.targetId;
+            return parsed.targetId;
+          }
         }
       } catch(e) {}
     }
@@ -21239,7 +21279,12 @@ ${roundSpeeches}
     if (cache[k] && candidates && candidates.some(c => c.id === cache[k])) {
       const chosenId = cache[k];
       delete cache[k];
-      return chosenId;
+      // 安全守衛：壞人絕不投票給已知隊友
+      if (!pov.isGoodCamp && (pov.knownTeammateIds || []).includes(chosenId)) {
+        console.warn(`[decidePersonVote] 阻擋自殘投票：壞人【${pov.myName}】試圖投票給隊友【${chosenId}】，改由本機安全引擎接手！`);
+      } else {
+        return chosenId;
+      }
     }
     return BotDeductionEngine._origDecidePersonVote(pov, beliefs, candidates);
   };
