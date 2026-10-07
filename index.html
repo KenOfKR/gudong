@@ -10,7 +10,7 @@
  <meta name="theme-color" content="#0a0a0a">  
  <meta name="format-detection" content="telephone=no">  
  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏺</text></svg>">
- <title>古董局中局 (v3.0.0 旗艦版)</title>  
+ <title>古董局中局 (v3.0.1 正常玩家推理 + Gemini 真決策強化版)</title>  
  <script src="https://cdn.tailwindcss.com"></script>  
  <link rel="preconnect" href="https://fonts.googleapis.com">  
  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>  
@@ -3923,23 +3923,25 @@ class NormalPlayerReasoningEngine {
   // 全域 3 壞人假設約束求解器 (True 3-Evil Hypothesis Consistency Search)
   // 透過 C(N, 3) 窮舉假設空間，綜合「發言矛盾」、「傳位意圖」、「投票紀錄」與「人數上限」進行全盤邏輯推演
   static solveGlobalConstraints(roleScores, pov, cognitiveDNA, beliefsRef) {
-    const candidateIds = Object.keys(roleScores).filter(id => !roleScores[id].isKnownTeammate);
-    if (candidateIds.length < 3) return;
+    const allRoleIds = Object.keys(roleScores);
+    const fixedEvilIds = allRoleIds.filter(id => roleScores[id].isKnownTeammate);
+    const candidateIds = allRoleIds.filter(id => !roleScores[id].isKnownTeammate);
+    const slotsToChoose = Math.max(0, NORMAL_PLAYER_MODEL.globalConstraints.totalEvilPlayers - fixedEvilIds.length);
+    if (candidateIds.length < slotsToChoose) return;
 
-    // 1. 生成所有 3 壞人假設 (若好人視角則從其餘玩家中選 3 人，壞人視角已知隊友)
-    const combinations3 = (arr) => {
+    // 已知隊友已經占用壞人名額，其餘名額再從未知玩家中窮舉。
+    const combinations3 = (arr, chooseN) => {
       const res = [];
-      for (let i = 0; i < arr.length - 2; i++) {
-        for (let j = i + 1; j < arr.length - 1; j++) {
-          for (let k = j + 1; k < arr.length; k++) {
-            res.push([arr[i], arr[j], arr[k]]);
-          }
-        }
+      if (chooseN === 0) return [[]];
+      if (arr.length < chooseN) return res;
+      for (let i = 0; i < arr.length - chooseN + 1; i++) {
+        const tail = combinations3(arr.slice(i + 1), chooseN - 1);
+        tail.forEach(rest => res.push([arr[i], ...rest]));
       }
       return res;
     };
 
-    const hypotheses = combinations3(candidateIds);
+    const hypotheses = combinations3(candidateIds, slotsToChoose).map(extra => [...fixedEvilIds, ...extra]);
     if (hypotheses.length === 0) return;
 
     const scoredHypotheses = [];
@@ -4018,7 +4020,18 @@ class NormalPlayerReasoningEngine {
       const calibratedEvil = Math.round(Math.max(5, Math.min(95, marginalEvilProb * 100)));
       roleScores[id].evilScore = calibratedEvil;
       roleScores[id].goodScore = 100 - calibratedEvil;
-      roleScores[id].laoChaoFeng = Math.round(calibratedEvil * ((roleScores[id].laoChaoFeng || 20) / Math.max(1, roleScores[id].evilScore || 50)));
+      roleScores[id].laoChaoFeng = calibratedEvil;
+    });
+
+    fixedEvilIds.forEach(id => {
+      if (roleScores[id]) {
+        roleScores[id].evilScore = 100;
+        roleScores[id].goodScore = 0;
+        roleScores[id].laoChaoFeng = 100;
+        roleScores[id].isConfirmedEvil = true;
+        roleScores[id].badDeeds = roleScores[id].badDeeds || [];
+        if (!roleScores[id].badDeeds.includes('已知陣營隊友（視野確認）')) roleScores[id].badDeeds.unshift('已知陣營隊友（視野確認）');
+      }
     });
 
     // 4. 存儲前 3 組最可能壞人組合，提供 Gemini 及各模組直接查閱
@@ -4267,37 +4280,90 @@ class NormalPlayerReasoningEngine {
       }
     });
 
-    // 藥不然與老朝奉同盟：偷方震連鎖許願推理
+    // 藥不然與老朝奉同盟：偷方震連鎖許願推理 (嚴密修正版：考慮直接偷襲對象記憶與平民亂喊煙霧彈)
     if (pov.myRole === '藥不然' || pov.myRole === '老朝奉') {
       const ambushList = pov.yaoAmbushHistory || [];
-      const ambushKeywords = /(被偷襲|眼前一片黑|偷襲我|螢幕全黑|被幹瞎|失血過多|驗不到|看不到獸首|接過來就是黑的|沒看到獸首|被致盲)/;
+      // 收集全場所有被藥不然「直接偷襲過」的目標 ID（包含歷史與當輪）
+      const allDirectlyAmbushedIds = new Set(ambushList.map(a => a.targetId));
+      if (pov.myCurrentAmbushedTargetId) allDirectlyAmbushedIds.add(pov.myCurrentAmbushedTargetId);
+
+      const isAffirmativeAmbush = /(我被偷襲|我眼前一片黑|偷襲我|我被幹|我被致盲|螢幕全黑|接過來就是黑的|失血過多|我都看不到獸首)/;
+      const isNegationOrQuestion = /(沒被偷襲|沒被致盲|不是我|誰被偷襲|有沒有人被偷襲|誰瞎了|如果被偷襲)/;
+
       ambushList.forEach(amb => {
         const targetAId = amb.targetId;
         const ambRound = amb.roundIdx;
         const targetA = pov.otherPlayers.find(p => p.id === targetAId);
         if (!targetA) return;
 
+        // 僅檢視該偷襲生效當輪或次輪之發言
         const rSpeeches = (pov.speeches && pov.speeches[ambRound]) || [];
-        const nextSpeeches = (pov.speeches && pov.speeches[ambRound + 1]) || [];
-        [...rSpeeches, ...nextSpeeches].forEach(sp => {
-          const spId = sp.playerId || sp.speakerId;
-          if (spId && spId !== targetAId && spId !== pov.myId && !(pov.knownTeammateIds || []).includes(spId)) {
-            const spText = sp.speech || sp.text || '';
-            if (ambushKeywords.test(spText)) {
-              const targetB = pov.otherPlayers.find(p => p.id === spId);
-              if (targetB) {
-                if (roleScores[targetAId]) roleScores[targetAId].fangZhen += 55;
-                if (roleScores[spId]) roleScores[spId].xuYuan += 70;
-                pov._yaoFangXuDeduction = {
-                  fangId: targetAId,
-                  fangName: targetA.name,
-                  xuId: spId,
-                  xuName: targetB.name,
-                  round: ambRound + 1
-                };
-              }
+        const nextSpeeches = (ambRound + 1 <= curRoundIdx && pov.speeches && pov.speeches[ambRound + 1]) || [];
+        const candidateSpeeches = [...rSpeeches, ...nextSpeeches];
+
+        // 統計該輪聲稱被致盲的非隊友且非直接偷襲目標的總人數
+        let blindClaimants = [];
+        candidateSpeeches.forEach(sp => {
+          const sId = sp.playerId || sp.speakerId;
+          const sText = sp.speech || sp.text || '';
+          if (sId && sId !== targetAId && sId !== pov.myId && !(pov.knownTeammateIds || []).includes(sId)) {
+            // 第一點重大修復：若該玩家本身就是藥不然在某回合直接偷襲的對象，他是自己被偷襲，絕非連鎖致盲！
+            if (allDirectlyAmbushedIds.has(sId)) return;
+            if (isAffirmativeAmbush.test(sText) && !isNegationOrQuestion.test(sText)) {
+              if (!blindClaimants.includes(sId)) blindClaimants.push(sId);
             }
           }
+        });
+
+        // 第二點重大修復：評估真實把握度 (Confidence)，防止被好人平民假裝或亂喊煙霧彈誤導
+        blindClaimants.forEach(spId => {
+          const targetB = pov.otherPlayers.find(p => p.id === spId);
+          if (!targetB) return;
+
+          let conf = 0.35; // 基礎口頭聲稱可信度（言詞本身存在詐欺機率）
+
+          // A. 檢驗 targetA (疑似方震) 的行為特徵
+          // 方震無法驗獸首，發言通常不具備明確獸首真偽細節或稱看不懂
+          let aGaveBeastClaims = false;
+          (pov.speeches || []).forEach(rSpList => {
+            (rSpList || []).forEach(sp => {
+              if ((sp.playerId === targetAId || sp.speakerId === targetAId)) {
+                const txt = sp.speech || sp.text || '';
+                if (txt.includes('真品') || txt.includes('贗品') || txt.includes('保真')) aGaveBeastClaims = true;
+              }
+            });
+          });
+          if (!aGaveBeastClaims) {
+            conf += 0.15; // targetA 確實不報獸首細節，高度吻合方震！
+          } else {
+            conf -= 0.20; // targetA 言之鑿鑿報獸首，大概率不是方震，削弱信心！
+          }
+
+          // B. 檢驗 targetB (疑似許願) 的行為特徵
+          // 許願在未被致盲的輪次每輪驗 2 件獸首，常具有領導性或雙獸首線索
+          const bScore = roleScores[spId] || {};
+          if (bScore.goodScore >= 60) conf += 0.10;
+          if (bScore.credibility < 0.40) conf -= 0.15; // 誠信度低或胡亂發言者大概率在亂喊放煙霧彈
+
+          // C. 全場喊盲人數檢驗
+          if (blindClaimants.length > 1) {
+            conf -= 0.20; // 多人喊盲，明顯場上有人在瞎起鬨或放煙霧彈！
+          }
+
+          conf = Math.max(0.10, Math.min(0.85, conf));
+
+          // 僅依據把握度加成，不再無腦覆蓋
+          if (roleScores[targetAId]) roleScores[targetAId].fangZhen += Math.round(50 * conf);
+          if (roleScores[spId]) roleScores[spId].xuYuan += Math.round(50 * conf);
+
+          pov._yaoFangXuDeduction = {
+            fangId: targetAId,
+            fangName: targetA.name,
+            xuId: spId,
+            xuName: targetB.name,
+            round: ambRound + 1,
+            confidence: conf // 精確把握度 (0.10 ~ 0.85)
+          };
         });
       });
     }
@@ -4418,23 +4484,100 @@ class NormalPlayerReasoningEngine {
     }
 
     // -------------------------------------------------------------------------
-    // 6. 全域 3 壞人硬約束求解器 (Global Constraint Solver)
+    // 6. 跨回合公開資訊證據整合 (Cross-Round Evidence)
     // -------------------------------------------------------------------------
-    const topEvilHypotheses = this.solveGlobalConstraints(roleScores, pov, cognitiveDNA) || [];
+    const addEvidence = (id, evilDelta, goodDelta, label, meta = {}) => {
+      const rs = roleScores[id];
+      if (!rs) return;
+      rs.evilScore = Math.max(0, Math.min(100, rs.evilScore + evilDelta));
+      rs.goodScore = Math.max(0, Math.min(100, rs.goodScore + goodDelta));
+      rs.evidence = rs.evidence || [];
+      rs.evidence.push({ label, ...meta });
+    };
 
-    // -------------------------------------------------------------------------
-    // 7. 第二回合認知目標檢驗 (round2Goal)
-    // -------------------------------------------------------------------------
-    if (curRoundIdx >= 1 && pov.isGoodCamp) {
-      const topEvil = Object.values(roleScores).filter(r => r.evilScore >= 55);
-      if (topEvil.length < NORMAL_PLAYER_MODEL.round2.minConfirmedEvilCandidates) {
-        Object.values(roleScores).forEach(r => {
-          if (!r.isKnownTeammate && r.credibility < 0.6) {
-            r.evilScore += 8;
-          }
+    (pov.speeches || []).forEach((roundSpeeches, rIdx) => {
+      if (rIdx > curRoundIdx || !Array.isArray(roundSpeeches)) return;
+      const vr = (pov.voteResults && pov.voteResults[rIdx]) || null;
+      const revealed = [];
+      if (vr?.rank1?.name && typeof vr.rank1.isReal === 'boolean') revealed.push({ name: vr.rank1.name, isReal: vr.rank1.isReal });
+      if (vr?.rank2?.name && typeof vr.rank2.isReal === 'boolean') revealed.push({ name: vr.rank2.name, isReal: vr.rank2.isReal });
+      roundSpeeches.forEach((sp, spIdx) => {
+        const sid = sp?.speakerId || sp?.playerId;
+        if (!sid || sid === pov.myId || !roleScores[sid]) return;
+        const txt = sp?.text || sp?.speech || '';
+        let correct = 0, wrong = 0;
+        revealed.forEach(rv => {
+          const claim = extractBeastClaim(txt, rv.name);
+          if (claim === null) return;
+          if (claim === rv.isReal) correct++; else wrong++;
         });
+        if (correct) {
+          addEvidence(sid, -2.5 * correct, 2.5 * correct, '公開揭曉後發言命中', { round: rIdx + 1, correctClaims: correct, position: spIdx + 1 });
+          roleScores[sid].credibility = Math.min(0.95, roleScores[sid].credibility + 0.04 * correct);
+        }
+        if (wrong) {
+          addEvidence(sid, 7 * wrong, -7 * wrong, '公開揭曉後發言被打臉', { round: rIdx + 1, wrongClaims: wrong, position: spIdx + 1 });
+          roleScores[sid].credibility = Math.max(0.12, roleScores[sid].credibility - 0.12 * wrong);
+          roleScores[sid].badDeeds.push(`第${rIdx + 1}輪公開發言與揭曉結果衝突`);
+        }
+      });
+    });
+
+    (pov.pastVotes || []).forEach((voteMapByPlayer, rIdx) => {
+      if (rIdx >= curRoundIdx || !voteMapByPlayer || typeof voteMapByPlayer !== 'object') return;
+      const vr = (pov.voteResults && pov.voteResults[rIdx]) || null;
+      const realNames = [vr?.rank1, vr?.rank2].filter(x => x && x.isReal === true).map(x => x.name);
+      const fakeNames = [vr?.rank1, vr?.rank2].filter(x => x && x.isReal === false).map(x => x.name);
+      Object.entries(voteMapByPlayer).forEach(([pid, ballot]) => {
+        if (pid === pov.myId || !roleScores[pid] || roleScores[pid].isKnownTeammate) return;
+        let s = 0;
+        Object.entries(ballot || {}).forEach(([bn, count]) => {
+          const n = Math.max(0, parseInt(count) || 0);
+          if (!n) return;
+          if (realNames.includes(bn)) s += 0.9 * n;
+          if (fakeNames.includes(bn)) s -= 1.2 * n;
+        });
+        if (s > 0) addEvidence(pid, -Math.min(4, s), Math.min(4, s), '歷史獸首投票偏向真品', { round: rIdx + 1, accuracySignal: s });
+        if (s < 0) addEvidence(pid, Math.min(5, -s), -Math.min(5, -s), '歷史獸首投票偏向贗品', { round: rIdx + 1, accuracySignal: s });
+      });
+    });
+
+    // 傳遞關係是弱證據，不直接等同於同隊。
+    Object.entries(relationshipScore).forEach(([aId, targets]) => {
+      if (!roleScores[aId]) return;
+      Object.entries(targets || {}).forEach(([bId, rel]) => {
+        if (aId === bId || !roleScores[bId] || rel <= 0) return;
+        const relation = Math.min(0.55, rel);
+        const aRisk = (roleScores[aId].evilScore || 50) / 100;
+        if (aRisk >= 0.65) addEvidence(bId, 5 * relation, -5 * relation, '與高嫌疑玩家存在關聯傳遞', { linkedPlayerId: aId, relation });
+        else if (aRisk <= 0.35) addEvidence(bId, -3 * relation, 3 * relation, '與偏好人玩家存在關聯傳遞', { linkedPlayerId: aId, relation });
+      });
+    });
+
+    if (curRoundIdx >= 2) {
+      const r3 = (pov.passOrders && pov.passOrders[2]) || [];
+      if (r3.length >= 2) {
+        const firstId = r3[0], secondId = r3[1];
+        const a = roleScores[firstId], b = roleScores[secondId];
+        if (a && b && !a.isKnownTeammate && !b.isKnownTeammate) {
+          const signal = Math.min(0.35, NORMAL_PLAYER_MODEL.round3.sameCampPassWeight * 0.25 * (0.75 + actionDNA.riskTolerance * 0.5));
+          if ((a.evilScore || 50) >= 60) addEvidence(secondId, signal * 100 * NORMAL_PLAYER_MODEL.round3.firstPassSignalWeight, -signal * 100 * NORMAL_PLAYER_MODEL.round3.firstPassSignalWeight, '第三回合首家傳給高嫌疑玩家', { from: firstId, signal });
+          else if ((a.evilScore || 50) <= 40) addEvidence(secondId, -signal * 70 * NORMAL_PLAYER_MODEL.round3.firstPassSignalWeight, signal * 70 * NORMAL_PLAYER_MODEL.round3.firstPassSignalWeight, '第三回合首家傳給偏好人玩家', { from: firstId, signal });
+        }
       }
     }
+
+    const evilCandidateCount = Object.values(roleScores).filter(r => !r.isKnownTeammate && r.evilScore >= 55).length;
+    const round2Goal = {
+      minimumCandidates: NORMAL_PLAYER_MODEL.round2.minConfirmedEvilCandidates,
+      achieved: evilCandidateCount >= NORMAL_PLAYER_MODEL.round2.minConfirmedEvilCandidates,
+      candidateCount: evilCandidateCount
+    };
+
+    // -------------------------------------------------------------------------
+    // 7. 全域 3 壞人硬約束求解器 (Global Constraint Solver)
+    // -------------------------------------------------------------------------
+    const topEvilHypotheses = this.solveGlobalConstraints(roleScores, pov, cognitiveDNA) || [];
 
     // -------------------------------------------------------------------------
     // 8. 壞人老朝奉暴露/隱匿決策模型 (Lao Chao Feng Risk-Reward Dilemma)
@@ -4495,6 +4638,7 @@ class NormalPlayerReasoningEngine {
       roleScores,
       badDeedsRanking,
       topEvilHypotheses,
+      round2Goal,
       lastValidSpeech: lastValidSpeech ? (lastValidSpeech.text || '') : '',
       anchorBeastRecommendation: anchorBeastRecommendation || (currentBeastNames[0] || ''),
       hypotheses,
@@ -4837,6 +4981,28 @@ class BotDeductionEngine {
         candidates = pov.otherPlayers.filter(p => p.id !== pov.myId);
       }
       if (candidates.length === 0) return { ability: '已完成能力行動', abilityLocked: true };
+
+      // 認知鄭國渠：老朝奉與藥不然都不知道鄭國渠是誰，但藥不然可以從票型與發言中，
+      // 推敲出場上「幾乎沒被任何人懷疑過」的那位最可能就是悶聲不響的第三位隊友，
+      // 從第 2 回合起主動避開偷襲他，避免親手封鎖掉自己人的查驗能力。
+      if (curRoundIdx >= 1 && candidates.length >= 1) {
+        const zgqRanked = [...candidates].sort((a, b) => {
+          const sa = (beliefs && beliefs.roleScores && beliefs.roleScores[a.id]) || {};
+          const sb = (beliefs && beliefs.roleScores && beliefs.roleScores[b.id]) || {};
+          const totalA = (sa.laoChaoFeng || 0) + (sa.fangZhen || 0) + (sa.xuYuan || 0) + (sa.evilScore || 0);
+          const totalB = (sb.laoChaoFeng || 0) + (sb.fangZhen || 0) + (sb.xuYuan || 0) + (sb.evilScore || 0);
+          return totalA - totalB; // 全場嫌疑總分越低，越像是悶聲不響的隊友
+        });
+        const suspectedZgqId = zgqRanked[0].id;
+        const candidatesWithoutZgq = candidates.filter(c => c.id !== suspectedZgqId);
+        if (candidatesWithoutZgq.length > 0) {
+          candidates = candidatesWithoutZgq;
+        } else if (curRoundIdx === 2) {
+          // 第三回合，排除疑似鄭國渠後已無其他可偷襲對象：謹慎起見只查驗不偷襲
+          return { ability: '謹慎起見，本回合只查驗獸首、不發動偷襲', abilityLocked: true, skipAmbush: true };
+        }
+        // 第二回合若排除後沒有其他候選，資訊仍太少，保留原名單不過度保守
+      }
 
       // 依最新指示：藥不然主動積極「往前偷襲」！在尾家與任何順位皆極為關鍵，絕不隨意放棄動作！
       // 判定候選玩家在傳遞鏈中是否在藥不然之前（前置位 / 已操作過玩家）
@@ -5441,9 +5607,9 @@ class BotDeductionEngine {
         const goodCandidates = candidates.filter(c => !(pov.knownTeammateIds || []).includes(c.id));
         if (goodCandidates.length === 0) return candidates[0].id;
 
-        // 老朝奉抓許願（若已有連鎖致盲情報，100% 鎖定許願！）
+        // 老朝奉抓許願（僅在把握度 >= 60% 時才納入軟鎖定考量，防範好人平民亂喊）
         if (pov.myRole === '老朝奉') {
-          if (pov._yaoFangXuDeduction && pov._yaoFangXuDeduction.xuId) {
+          if (pov._yaoFangXuDeduction && pov._yaoFangXuDeduction.xuId && (pov._yaoFangXuDeduction.confidence || 0) >= 0.60 && Math.random() < 0.5) {
             const xTarget = goodCandidates.find(c => c.id === pov._yaoFangXuDeduction.xuId);
             if (xTarget) return xTarget.id;
           }
@@ -5453,9 +5619,9 @@ class BotDeductionEngine {
           }).sort((a, b) => b.score - a.score);
           return scored[0].id;
         }
-        // 藥不然抓方震（若已推導出偷A引發連帶致盲，首選 A 為方震！）
+        // 藥不然抓方震（僅在把握度 >= 60% 時才納入軟鎖定考量，防範好人平民亂喊）
         else if (pov.myRole === '藥不然') {
-          if (pov._yaoFangXuDeduction && pov._yaoFangXuDeduction.fangId) {
+          if (pov._yaoFangXuDeduction && pov._yaoFangXuDeduction.fangId && (pov._yaoFangXuDeduction.confidence || 0) >= 0.60 && Math.random() < 0.5) {
             const fTarget = goodCandidates.find(c => c.id === pov._yaoFangXuDeduction.fangId);
             if (fTarget) return fTarget.id;
           }
@@ -5717,16 +5883,89 @@ class BotDeductionEngine {
     }
 
     // -------------------------------------------------------------------------
-    // 依需求：藥不然偷到方震後許願也被偷襲的概念，向老朝奉喊話（機率觸發）
+    // 依指示更新：藥不然連鎖偷襲推演發言
+    // 1. 除非有 60% 以上把握 (confidence >= 0.60)，否則絕不隨便亂跳身分！保護老朝奉不被找到！
+    // 2. 跳的時候不用喊隊友的名字（絕不提老朝奉，保護老朝奉）！
+    // 3. 有 50% 機率喊自己的名字擾亂好人視角，另 50% 機率不喊自己名字客觀分析！
     // -------------------------------------------------------------------------
-    if (pov.myRole === '藥不然' && pov._yaoFangXuDeduction && Math.random() < 0.85) {
-      const { fangName, xuName } = pov._yaoFangXuDeduction;
-      const yaoStyles = [
-        `老朝奉聽好了！我這局偷襲【${fangName}】，結果【${xuName}】發言也說眼前一片黑驗不到！這節奏很高機率是偷到方震連帶炸出許願！【${xuName}】極大概率就是許願，鑑人環節老朝奉盯死他，別投偏了！`,
-        `場上局勢有點意思，我動了【${fangName}】，但【${xuName}】好像也跟著盲了。按規則這很有可能是方震連鎖，老朝奉心裡有數，【${xuName}】八成就是許願！`,
-        `剛才我點了【${fangName}】，結果【${xuName}】說他也沒看清？這波很可能是方震連鎖，老朝奉鑑人注意，【${xuName}】八成就是真許願！`
-      ];
-      return finalize(pickOne(yaoStyles));
+    if (pov.myRole === '藥不然' && pov._yaoFangXuDeduction) {
+      const deductionConf = pov._yaoFangXuDeduction.confidence || 0.4;
+      // 門檻檢驗：把握度未達 60%，絕對嚴格保持隱匿，走下方正常普通玩家發言！
+      if (deductionConf >= 0.60 && Math.random() < 0.75) {
+        const { fangName, xuName } = pov._yaoFangXuDeduction;
+        const callSelfName = (Math.random() < 0.50); // 50% 機率喊自己名字，50% 不喊
+
+        let yaoStyles = [];
+        if (callSelfName) {
+          // 依指示：50% 機率喊「藥不然聽好了！」，以自身角色名向外喊話擾亂好人視角，絕不提老朝奉！
+          yaoStyles = [
+            `藥不然聽好了！這局偷襲【${fangName}】，結果【${xuName}】發言也說眼前一片黑！這節奏很可能連帶炸出許願，【${fangName}】大概是方震，【${xuName}】很可能是許願！`,
+            `藥不然注意！場上動了【${fangName}】，但【${xuName}】也跟著喊致盲，按規則極大概率是方震連鎖致盲許願，大家心裡有數！`,
+            `藥不然聽好！【${fangName}】被動了之後【${xuName}】也說沒看清，這波八成是方震連鎖，這兩人身分大有問題，自己看著辦！`
+          ];
+        } else {
+          // 另 50% 機率不喊角色稱呼：客觀或旁觀角度分析，絕不自爆隊友！
+          yaoStyles = [
+            `場上局勢有點意思，【${fangName}】被動了之後【${xuName}】好像也跟著盲了。按規則這很有可能是方震連鎖，【${xuName}】八成就是許願！`,
+            `剛才【${fangName}】和【${xuName}】同時出現致盲發言？這波很可能是方震連鎖致盲許願，大家投票心裡要有數！`,
+            `這局情勢很明顯，【${fangName}】跟【${xuName}】的發言對照一下就很清楚，極大概率是方震連帶致盲許願，大家別被牽著走！`
+          ];
+        }
+        return finalize(pickOne(yaoStyles));
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // C. 各陣營進階心理戰：「喊話藥不然」煙霧彈與試探策略（非 100% 執行，各有各的動機邏輯）
+    // 1. 壞人老朝奉 (約 20% 機率)：偽裝正義好人斥責藥不然，或反向放煙霧彈轉移焦點，掩護真身
+    // 2. 壞人鄭國渠 (約 25% 機率)：心腹吸票攪局，故意假裝高層下令發號施令，替老朝奉擋刀
+    // 3. 好人陣營 (約 18% 機率)：手握情報主動嗆聲、釣魚或反向試探壞人反應
+    // -------------------------------------------------------------------------
+    if (!pov.myInspectWasBlinded) {
+      const r_shout = Math.random();
+
+      // 1. 老朝奉：放煙霧彈假裝在抓藥不然，洗清自己嫌疑
+      if (pov.myRole === '老朝奉' && r_shout < 0.20) {
+        const laoShouts = [
+          `藥不然聽好了！你別以為暗中偷襲沒人察覺，這把好人全體看穿你的套路了！這件【${reportedBeast}】我們必保【${reportedStatus}】，老朝奉今天插翅也難飛！`,
+          `藥不然聽好了！有種下輪別再躲在後面偷襲，敢來正面跟我們拼票嗎？這輪【${reportedBeast}】手感極沉是【${reportedStatus}】，好人票全部集中！`,
+          `藥不然聽好了！別再想著分化好人票源帶風向，【${reportedBeast}】我們鐵了心就是要保【${reportedStatus}】，全場好人跟我鎖定！`
+        ];
+        return finalize(pickOne(laoShouts));
+      }
+
+      // 2. 鄭國渠：假裝黑幫高層指揮，高調吸票替老朝奉擋刀
+      if (pov.myRole === '鄭國渠' && r_shout < 0.25) {
+        const zhengShouts = [
+          `藥不然聽好了！這把節奏掌握在我們手裡，【${reportedBeast}】全力給它灌上去，別管其他人怎麼說，這把讓好人陣營徹底翻盤！`,
+          `藥不然聽好！盯緊我們想要的真品，老朝奉的計畫絕不容有失，【${reportedBeast}】全票給我壓過去，這局勝利是我們的！`,
+          `藥不然聽好了！前置位已經把水攪渾了，【${reportedBeast}】你心裡有數，鑑寶環節給我打起精神，誰敢擋道直接踩死！`
+        ];
+        return finalize(pickOne(zhengShouts));
+      }
+
+      // 3. 好人陣營 (許願 / 方震 / 姬雲浮 / 黃煙煙 / 木戶加奈)：公開嗆聲、釣魚炸身分
+      if (pov.isGoodCamp && r_shout < 0.18) {
+        if (pov.myRole === '許願') {
+          const xuShouts = [
+            `藥不然聽好了！你上一輪偷襲根本沒用，我手裡【${reportedBeast}】是真是假我一清二楚是【${reportedStatus}】，有種這輪再來偷襲我試試看！`,
+            `藥不然聽好了！你別想再暗中搞破壞，這把好人資訊已經串聯，【${reportedBeast}】確定保真【${reportedStatus}】，大家跟我投！`
+          ];
+          return finalize(pickOne(xuShouts));
+        } else if (pov.myRole === '方震') {
+          const fzShouts = [
+            `藥不然聽好了！你別以為暗算別人沒人看見，有種光明正大來對沖，這件【${reportedBeast}】我看就是【${reportedStatus}】，好人跟我投！`,
+            `藥不然聽好了！你的小動作全場都在看，好人全體團結起來，這件【${reportedBeast}】鎖定【${reportedStatus}】，絕不讓你得逞！`
+          ];
+          return finalize(pickOne(fzShouts));
+        } else {
+          const goodShouts = [
+            `藥不然聽好了！你偷襲誰誰就是我們好人全力保的對象！這局【${reportedBeast}】確定是【${reportedStatus}】，你跟老朝奉誰也別想逃！`,
+            `藥不然聽好了！少在後面鬼鬼祟祟搞偷襲，好人只要票數集中，【${reportedBeast}】（【${reportedStatus}】）這分我們拿定了！`
+          ];
+          return finalize(pickOne(goodShouts));
+        }
+      }
     }
 
 
@@ -13864,6 +14103,18 @@ function renderOnlinePersonVotingReference(room) {
     // =========================================================================
     // _mockActionPending and _lastMockActionTime are declared globally
 
+    async function getFreshMockThinkingRoom(expectedStatus, actorField, actorId, fallbackRoom) {
+      try {
+        if (!db || !ONLINE_ROOM_DOC) return fallbackRoom;
+        const snap = await db.doc(ONLINE_ROOM_DOC).get();
+        const data = snap.exists ? snap.data() : null;
+        if (data && data.status === expectedStatus && data[actorField] === actorId) return data;
+      } catch(e) {
+        console.warn('[MockAI] 讀取最新局面失敗，沿用目前快照:', e.message);
+      }
+      return fallbackRoom;
+    }
+
     async function executeMockTurnStep(room, mockPlayerId, curRound) {
       _mockActionPending = true;
       _lastMockActionTime = Date.now();
@@ -13875,9 +14126,10 @@ function renderOnlinePersonVotingReference(room) {
       }
 
       let geminiNextId = null;
+      const thinkingRoom = await getFreshMockThinkingRoom('playing', 'currentTurnPlayerId', mockPlayerId, room);
       if (window.GeminiBrain && window.GeminiBrain.cfg().on) {
         try {
-          geminiNextId = await GeminiBrain.prepareTurn(room, mockPlayerId);
+          geminiNextId = await GeminiBrain.prepareTurn(thinkingRoom, mockPlayerId);
         } catch(e) {
           console.warn('[MockTurn] Gemini 思考傳遞逾時，改由本地引擎接手:', e);
         }
@@ -13889,6 +14141,7 @@ function renderOnlinePersonVotingReference(room) {
         const docRef = db.doc(ONLINE_ROOM_DOC);
         let shouldAdvanceToDiscussion = false;
         let latestRoom = null;
+        const geminiContextFresh = !!(window.GeminiBrain && typeof GeminiBrain.isFreshDecisionContext === 'function');
 
         await db.runTransaction(async (transaction) => {
           const snap = await transaction.get(docRef);
@@ -13899,6 +14152,10 @@ function renderOnlinePersonVotingReference(room) {
           }
           const roundObj = freshRoom.rounds && freshRoom.rounds[freshRoom.currentRoundIdx];
           if (!roundObj) return;
+          if (geminiNextId && geminiContextFresh && !GeminiBrain.isFreshDecisionContext('turn', freshRoom, mockPlayerId)) {
+            console.warn(`🧠 [Gemini] 【${mockPlayerId}】思考期間局面已變更，捨棄過期傳位答案`);
+            geminiNextId = null;
+          }
 
           const freshMockP = (freshRoom.players || []).find(p => p.id === mockPlayerId);
           if (!freshMockP) return;
@@ -14288,9 +14545,12 @@ function renderOnlinePersonVotingReference(room) {
           const pVotes = freshData.personVotes || {};
           if (pVotes[mockPlayerId]) return;
 
-          const candidates = (freshData.players || []).filter(p => p.id !== mockPlayerId);
+          const botPOV = BotDeductionEngine.buildPOV(freshData, mockPlayerId);
+          const teammatesForCandidates = botPOV.knownTeammateIds || [];
+          // 修復：候選名單從源頭就排除已知隊友
+          let candidates = (freshData.players || []).filter(p => p.id !== mockPlayerId && (botPOV.isGoodCamp || !teammatesForCandidates.includes(p.id)));
+          if (candidates.length === 0) candidates = (freshData.players || []).filter(p => p.id !== mockPlayerId);
           if (candidates.length > 0) {
-            const botPOV = BotDeductionEngine.buildPOV(freshData, mockPlayerId);
             const beliefs = BotDeductionEngine.evaluateBeliefs(botPOV);
 
             let chosenId = geminiChosenId;
@@ -15180,16 +15440,19 @@ function startOnlinePersonVoteDotsAnimation(votedCount) {
           `;
         }
         if (p.role === '藥不然' && pov._yaoFangXuDeduction) {
-          const { fangName, xuName, round } = pov._yaoFangXuDeduction;
+          const { fangName, xuName, round, confidence } = pov._yaoFangXuDeduction;
+          const confPct = Math.round((confidence || 0.4) * 100);
+          const isHighConf = (confidence || 0) >= 0.60;
           specialDeductionHtml += `
             <div class="p-3 rounded-xl bg-rose-950/70 border border-rose-500/80 text-rose-200 text-xs shadow-lg space-y-1">
               <div class="font-bold flex items-center gap-1.5 text-rose-300">
-                <span class="text-base">📡</span><span>【進階桌遊推理・偷方震連鎖致盲許願戰術】</span>
+                <span class="text-base">📡</span><span>【進階桌遊推理・偷方震連鎖致盲許願戰術分析】</span>
               </div>
               <div class="text-[11px] leading-relaxed text-neutral-200">
-                第 ${round} 輪偷襲目標為【${fangName}】，但發言中【${xuName}】亦聲稱遭襲眼前一片黑！<br>
+                第 ${round} 輪偷襲目標為【${fangName}】，發言中【${xuName}】亦聲稱遭致盲。<br>
                 規則邏輯：藥不然若偷襲到方震，許願將受到連帶偷襲致盲。<br>
-                推論判定：【${fangName}】大概率為<b>方震</b>，【${xuName}】極大概率為<b>許願</b>！電腦藥不然已在公開發言中向老朝奉發出暗號信號，終局鑑人將優先鎖定！
+                推論判定：【${fangName}】疑似為<b>方震</b>，【${xuName}】疑似為<b>許願</b>（推演把握度：<b>${confPct}%</b>）。<br>
+                風險評估：${isHighConf ? '各項行為特徵與時序吻合，把握度達標（≥60%），終局列入重點參考。發言時絕不喊隊友名字以保護老朝奉，並有50%機率喊「藥不然聽好了」混淆好人視角！' : '把握度未達 60% 門檻！經比對發言與過往偷襲紀錄，該玩家可能為先前直接偷襲之對象，或為好人平民假裝致盲之煙霧彈，故嚴守身分不隨便亂跳！'}
               </div>
             </div>
           `;
@@ -15305,7 +15568,7 @@ function startOnlinePersonVoteDotsAnimation(votedCount) {
             } else if (speechContent.includes('老朝奉在前面開了擾亂') || speechContent.includes('老朝奉必在傳遞序列我之前') || speechContent.includes('前面傳遞的') || speechContent.includes('擾亂！排在我前面')) {
               tag = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500 text-neutral-950 font-black ml-1">🔍 獸首時序逆推老朝奉</span>';
             } else if (speechContent.includes('老朝奉聽好') || speechContent.includes('炸出許願') || speechContent.includes('方震連鎖') || speechContent.includes('方震連帶') || speechContent.includes('老朝奉心裡有數') || speechContent.includes('老朝奉注意')) {
-              tag = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-red-600 text-neutral-100 font-black ml-1">📡 藥不然向老朝奉暗號喊話</span>';
+              tag = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-red-600 text-neutral-100 font-black ml-1">📡 藥不然發動連鎖致盲戰術發言</span>';
             } else if (speechContent.includes('老朝奉的人') || speechContent.includes('老朝奉那邊的') || speechContent.includes('幫老朝奉做事')) {
               tag = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-rose-600 text-neutral-100 font-black ml-1">🎭 許願反串跳壞人 (擾亂老朝奉)</span>';
             } else {
@@ -20001,9 +20264,12 @@ class BotSimulationEngine {
     // 鑑人投票
     room.personVotes = {};
     players.forEach(p => {
-      const candidates = players.filter(x => x.id !== p.id);
       const pov = BotDeductionEngine.buildPOV(room, p.id);
       const beliefs = BotDeductionEngine.evaluateBeliefs(pov);
+      // 修復：候選名單從源頭就排除已知隊友，壞人絕不會把隊友列入指認候選
+      const teammatesForVote = pov.knownTeammateIds || [];
+      let candidates = players.filter(x => x.id !== p.id && (pov.isGoodCamp || !teammatesForVote.includes(x.id)));
+      if (candidates.length === 0) candidates = players.filter(x => x.id !== p.id);
       const chosenId = BotDeductionEngine.decidePersonVote(pov, beliefs, candidates);
       room.personVotes[p.id] = chosenId || candidates[0].id;
     });
@@ -20247,9 +20513,12 @@ class BotSimulationEngine {
     // 鑑人投票環節
     room.personVotes = {};
     players.forEach(p => {
-      const candidates = players.filter(x => x.id !== p.id);
       const pov = BotDeductionEngine.buildPOV(room, p.id);
       const beliefs = BotDeductionEngine.evaluateBeliefs(pov);
+      // 修復：候選名單從源頭就排除已知隊友，壞人絕不會把隊友列入指認候選
+      const teammatesForVote = pov.knownTeammateIds || [];
+      let candidates = players.filter(x => x.id !== p.id && (pov.isGoodCamp || !teammatesForVote.includes(x.id)));
+      if (candidates.length === 0) candidates = players.filter(x => x.id !== p.id);
       const chosenId = BotDeductionEngine.decidePersonVote(pov, beliefs, candidates);
       room.personVotes[p.id] = chosenId || candidates[0].id;
     });
@@ -20622,11 +20891,11 @@ window.BotSimulationEngine = BotSimulationEngine;
 
 <script id="gemini-brain">
 /* =========================================================================
-   GeminiBrain v3：純粹 Google Gemini AI 智囊核心 (發言 / 傳位 / 鑑寶投票 / 鑑人指認)
+   GeminiBrain v3.1：Google Gemini 真決策 + 正常玩家推理協同核心 (發言 / 傳位 / 鑑寶投票 / 鑑人指認)
    - 專注串聯 Google Gemini 系列模型（優先輪詢降級：3.8 Flash ➔ 3.5 Lite ➔ 3.6 Flash ➔ 1.5 8B ➔ 2.5 Flash ➔ 1.5 Flash ➔ 1.5 Pro）
    - 預設開箱即用之安全代理伺服器 (Cloudflare Worker Proxy)，亦支援填入 API Key 直連官方 API
    - 跨裝置同步：Firestore 雲端持久化 41 位 AI 戰術教訓與成長記憶
-   - 非同步預取管道 (Prefetch Pipeline) + 本地規則引擎無縫兜底 (Zero-Deadlock)
+   - 即時決策等待 + 局面指紋防過期 + 本地規則引擎安全兜底 (Zero-Deadlock)
 ========================================================================= */
 (function(){
   // 內建預設安全代理伺服器網址（開箱即用，免手動重複輸入）
@@ -20679,6 +20948,26 @@ window.BotSimulationEngine = BotSimulationEngine;
   const mem = () => { try { return JSON.parse(localStorage.getItem(MEM) || '{}'); } catch(e) { return {}; } };
   const saveMem = m => { try { localStorage.setItem(MEM, JSON.stringify(m)); } catch(e) {} };
   const cache = {};
+  const decisionContexts = {};
+
+  function decisionContextSignature(room, kind, botId) {
+    const rIdx = Number.isInteger(room?.currentRoundIdx) ? room.currentRoundIdx : 0;
+    const r = room?.rounds?.[rIdx] || {};
+    const count = obj => obj && typeof obj === 'object' ? Object.keys(obj).length : 0;
+    return JSON.stringify({
+      kind, botId, status: room?.status || '', rIdx,
+      actor: kind === 'turn' ? room?.currentTurnPlayerId : (kind === 'speech' ? room?.currentSpeakerId : room?.status),
+      pass: (r.passOrder || []).length, speeches: (r.speeches || []).length,
+      votes: count(r.votes), peopleVotes: count(room?.personVotes)
+    });
+  }
+  function rememberDecisionContext(kind, room, botId) {
+    decisionContexts[`${kind}|${botId}`] = decisionContextSignature(room, kind, botId);
+  }
+  function isFreshDecisionContext(kind, room, botId) {
+    const k = `${kind}|${botId}`;
+    return !decisionContexts[k] || decisionContexts[k] === decisionContextSignature(room, kind, botId);
+  }
 
   // 純粹 Google Gemini API 呼叫器（支援智慧多模型輪詢降級：3.8 Flash ➔ 3.5 Lite ➔ 3.6 Flash ➔ 1.5 8B ➔ 2.5 Flash ➔ 1.5 Flash ➔ 1.5 Pro）
   async function ask(system, user, max, timeout) {
@@ -20731,7 +21020,8 @@ window.BotSimulationEngine = BotSimulationEngine;
             systemInstruction: { parts: [{ text: system }] },
             generationConfig: {
               temperature: 0.85,
-              maxOutputTokens: max || 220
+              maxOutputTokens: max || 220,
+              ...(user && user.includes('請輸出純 JSON 格式') ? { responseMimeType: 'application/json' } : {})
             }
           };
           if (effectiveKey) {
@@ -20745,7 +21035,8 @@ window.BotSimulationEngine = BotSimulationEngine;
             contents: [{ role: 'user', parts: [{ text: user }] }],
             generationConfig: {
               temperature: 0.85,
-              maxOutputTokens: max || 220
+              maxOutputTokens: max || 220,
+              ...(user && user.includes('請輸出純 JSON 格式') ? { responseMimeType: 'application/json' } : {})
             }
           };
         }
@@ -20924,8 +21215,22 @@ window.BotSimulationEngine = BotSimulationEngine;
         tacticalHint += `\n【壞人同伴互認】：你的首腦是【${laoP.name}】（老朝奉），你們彼此互認。你要暗中掩護老朝奉、迷惑好人，絕不可出賣或攻擊老朝奉！`;
       }
       if (pov._yaoFangXuDeduction) {
-        const { fangName, xuName } = pov._yaoFangXuDeduction;
-        tacticalHint += `\n【藥不然連鎖偷襲戰術】：你偷襲了【${fangName}】，但發言中【${xuName}】也好像被偷襲致盲！按遊戲規則，偷到方震會連帶讓許願致盲，因此【${fangName}】大概率是方震，而【${xuName}】極可能是許願！請在發言中向老朝奉喊話，提醒老朝奉【${xuName}】可能是許願！`;
+        const { fangName, xuName, confidence } = pov._yaoFangXuDeduction;
+        const confPct = Math.round((confidence || 0.4) * 100);
+        if ((confidence || 0) >= 0.60) {
+          tacticalHint += `\n【藥不然連鎖偷襲戰術（把握度: ${confPct}%）】：你偷襲了【${fangName}】，且【${xuName}】亦聲稱致盲。重要指令：發言時【絕對嚴禁提及隊友老朝奉或喊老朝奉名字】，避免老朝奉被好人順藤摸瓜抓出！你可以有 50% 機率喊「藥不然聽好了！」故弄玄虛反串擾亂好人視角，或以客觀分析角度指出兩人可疑。`;
+        } else {
+          tacticalHint += `\n【連鎖偷襲疑點提醒（把握度僅 ${confPct}% < 60%）】：雖然【${xuName}】聲稱致盲，但極可能是好人平民在亂喊或放煙霧彈詐欺，且你可能先前已偷襲過他。你的推演把握度不足 60%，【絕對不要跳身分】！請繼續偽裝成普通玩家報獸首真偽，保持低調！`;
+        }
+      }
+      if (pov.myRole === '老朝奉') {
+        tacticalHint += `\n【老朝奉進階心理戰術】：發言時可適度（約20%機率）假裝正義好人向暗處喊話「藥不然聽好了！」，斥責藥不然或反向帶風向，徹底洗清自身嫌疑，轉移好人焦點！`;
+      }
+      if (pov.myRole === '鄭國渠') {
+        tacticalHint += `\n【鄭國渠進階攪局戰術】：發言時可適度（約25%機率）高調向暗處喊話「藥不然聽好了！」，假裝黑幫核心發號施令，故意吸引好人注意與鑑人票，替老朝奉擋刀！`;
+      }
+      if (pov.isGoodCamp) {
+        tacticalHint += `\n【好人心理試探戰術】：發言時可適度（約15%機率）主動向暗處喊話「藥不然聽好了！」，進行釣魚挑釁或炸身分，逼壞人露出破綻！`;
       }
     }
     if (pov.myRole === '老朝奉') {
@@ -20995,6 +21300,7 @@ ${spokenList || '（你是第一位發言，前面尚無人開口）'}
       if (isValidBotSpeech(cleaned)) {
         const speech = cleaned.slice(0, 100);
         cache['speech|' + botId + '|' + pov.currentRoundIdx] = speech;
+        rememberDecisionContext('speech', room, botId);
         return speech;
       }
     }
@@ -21034,7 +21340,7 @@ ${spokenList || '（你是第一位發言，前面尚無人開口）'}
 - 第一回合（試探）：藥不然偷襲後絕不傳給被偷襲者；6號位向8號位發送尾家試探訊號。
 - 第二回合（爭尾）：好人把高嫌疑者往前送以消耗壞人，爭取讓好人保留在後方控尾；壞人把好人往前送，掩護隊友爭取尾家。
 - 第三回合（控發言序）：第6、7棒傳位決定誰是尾家，而尾家的左手邊玩家為發言首家！好人應將尾家左側安排為壞人（逼壞人無情報首發言），壞人則應逼好人首發言。
-請先進行深入盤局推理，最後選出目標。
+請先在模型內部比較不同候選方案，依「正常玩家規則 → 陣營目標 → DNA風格 → 風險回報」做決策；對外只輸出結論與極短依據，不輸出完整思考鏈。
 輸出純 JSON 格式：
 {
   "reasoning": "簡述你的盤局推演：分析查驗衝突、3壞人嫌疑組合、以及當前輪次的尾家控制目標",
@@ -21057,6 +21363,7 @@ ${spokenList || '（你是第一位發言，前面尚無人開口）'}
         const parsed = JSON.parse(out.replace(/```json|```/g, '').trim());
         if (parsed.targetPlayerId && candidates.some(c => c.id === parsed.targetPlayerId)) {
           cache['turn|' + botId + '|' + pov.currentRoundIdx] = parsed.targetPlayerId;
+          rememberDecisionContext('turn', room, botId);
           return parsed.targetPlayerId;
         }
       } catch(e) {}
@@ -21127,6 +21434,7 @@ ${roundSpeeches}
           });
           if (sum <= maxVotes) {
             cache['vote|' + botId + '|' + pov.currentRoundIdx] = ballot;
+            rememberDecisionContext('vote', room, botId);
             return ballot;
           }
         }
@@ -21150,16 +21458,16 @@ ${roundSpeeches}
     const candidates = (room.players || []).filter(p => p.id !== botId && (!isEvil || !teammates.includes(p.id)));
     if (candidates.length === 0) return;
 
-    // 【鐵證硬鎖定】：若藥不然已推導出偷方震連鎖致盲，100% 直取方震，不交由模型二次臆測
-    if (pov.myRole === '藥不然' && pov._yaoFangXuDeduction && pov._yaoFangXuDeduction.fangId) {
-      if (candidates.some(c => c.id === pov._yaoFangXuDeduction.fangId)) {
+    // 【規則級推理軟鎖定】：偷方震連鎖致盲必須把握度 >= 60% 且隨機命中才進行軟鎖定，
+    // 其餘情況完全交給模型結合全場線索與防詐評估進行綜合決策
+    if (pov.myRole === '藥不然' && pov._yaoFangXuDeduction && pov._yaoFangXuDeduction.fangId && (pov._yaoFangXuDeduction.confidence || 0) >= 0.60) {
+      if (candidates.some(c => c.id === pov._yaoFangXuDeduction.fangId) && Math.random() < 0.5) {
         cache['person_vote|' + botId] = pov._yaoFangXuDeduction.fangId;
         return pov._yaoFangXuDeduction.fangId;
       }
     }
-    // 【鐵證硬鎖定】：若老朝奉已獲悉連鎖致盲許願情報，100% 直取許願
-    if (pov.myRole === '老朝奉' && pov._yaoFangXuDeduction && pov._yaoFangXuDeduction.xuId) {
-      if (candidates.some(c => c.id === pov._yaoFangXuDeduction.xuId)) {
+    if (pov.myRole === '老朝奉' && pov._yaoFangXuDeduction && pov._yaoFangXuDeduction.xuId && (pov._yaoFangXuDeduction.confidence || 0) >= 0.60) {
+      if (candidates.some(c => c.id === pov._yaoFangXuDeduction.xuId) && Math.random() < 0.5) {
         cache['person_vote|' + botId] = pov._yaoFangXuDeduction.xuId;
         return pov._yaoFangXuDeduction.xuId;
       }
@@ -21221,6 +21529,7 @@ ${roundSpeeches}
             console.warn(`[Gemini preparePersonVote] 阻擋壞人指認隊友: ${parsed.targetId}，由本地安全引擎指認`);
           } else {
             cache['person_vote|' + botId] = parsed.targetId;
+            rememberDecisionContext('person_vote', room, botId);
             return parsed.targetId;
           }
         }
@@ -21267,7 +21576,7 @@ ${roundSpeeches}
     if (cache[k]) {
       const ballot = cache[k];
       delete cache[k];
-      return (typeof param3 === 'number') ? ballot : Object.assign(Object.keys(ballot), ballot);
+      return (typeof param3 === 'number') ? ballot : { ...ballot };
     }
     return BotDeductionEngine._origDecideVote(pov, beliefs, param3, param4);
   };
@@ -21564,7 +21873,9 @@ ${roundSpeeches}
     loadBotMemoriesFromFirestore,
     syncBotMemoriesToFirestore,
     ask,
-    cfg
+    cfg,
+    decisionContextSignature,
+    isFreshDecisionContext
   };
 
   if (document.readyState !== 'loading') {
